@@ -90,14 +90,16 @@ def check_lidar(kind, port):
 
 def check_camera(index):
     import cv2
-    cap = cv2.VideoCapture(index)
-    ok, frame = cap.read() if cap.isOpened() else (False, None)
-    cap.release()
-    if not ok:
-        print("FAIL: camera not readable at index", index)
+    from pi_node import _open_camera
+    grab = _open_camera(index)
+    frame = grab() if grab else None
+    if frame is None:
+        print("FAIL: no camera frame (Pi camera module or USB webcam)")
         return
-    cv2.imwrite("camera_test.jpg", frame)
-    print(f"PASS: captured {frame.shape[1]}x{frame.shape[0]} -> camera_test.jpg")
+    if frame.ndim == 3 and frame.shape[2] == 4:
+        frame = frame[:, :, :3]
+    cv2.imwrite("/dev/shm/camera_test.jpg", frame)
+    print(f"PASS: captured {frame.shape[1]}x{frame.shape[0]} -> /dev/shm/camera_test.jpg")
 
 
 if __name__ == "__main__":

@@ -325,20 +325,55 @@ class SimSonars:
 
 
 # ------------------------------------------------------------------ camera --
-def camera_loop(server, vehicle, index, stop):
+def _open_camera(index):
+    """Return a function that grabs one BGR frame, or None if no camera works.
+    Tries the Pi camera module first (Picamera2 / libcamera - the only way a
+    ribbon-cable camera works on a Pi 5), then a USB webcam through OpenCV."""
+    try:
+        from picamera2 import Picamera2   # system package: python3-picamera2
+        cams = Picamera2.global_camera_info()
+        if cams:
+            cam = Picamera2(0)
+            cam.configure(cam.create_video_configuration(
+                main={"size": (640, 480), "format": "RGB888"}))   # numpy array is BGR
+            cam.start()
+            time.sleep(1.0)                                       # let exposure settle
+            print(f"[CAM] Pi camera module: {cams[0].get('Model', 'camera')}")
+            return lambda: cam.capture_array("main")
+        print("[CAM] no Pi camera module detected (rpicam-hello --list-cameras)")
+    except ImportError:
+        print("[CAM] picamera2 not available - trying USB webcam")
+    except Exception as e:
+        print(f"[CAM] Pi camera error: {e} - trying USB webcam")
     import cv2
     cap = cv2.VideoCapture(index)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    if not cap.isOpened():
-        print(f"[CAM] cannot open camera {index}")
+    if cap.isOpened():
+        print(f"[CAM] USB webcam on index {index}")
+        return lambda: (lambda ok_f: ok_f[1] if ok_f[0] else None)(cap.read())
+    return None
+
+
+def camera_loop(server, vehicle, index, stop):
+    import cv2
+    grab = _open_camera(index)
+    if grab is None:
+        print("[CAM] no camera found - dashboard keeps its synthetic feed")
         return
     print(f"[CAM] streaming frames to {server}/api/camera/upload")
+    sent = 0
     while not stop.is_set():
-        ok, frame = cap.read()
-        if ok:
-            ok2, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-            if ok2:
+        try:
+            frame = grab()
+        except Exception as e:
+            print(f"[CAM] capture failed: {e}")
+            frame = None
+        if frame is not None:
+            if frame.ndim == 3 and frame.shape[2] == 4:
+                frame = frame[:, :, :3]
+            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            if ok:
                 try:
                     requests.post(
                         f"{server}/api/camera/upload",
@@ -346,10 +381,12 @@ def camera_loop(server, vehicle, index, stop):
                         data={"vehicle_id": vehicle},
                         timeout=6,
                     )
+                    sent += 1
+                    if sent == 1:
+                        print("[CAM] first frame uploaded - check the Vision AI panel")
                 except requests.RequestException as e:
                     print(f"[CAM] upload failed: {e}")
         stop.wait(CAMERA_INTERVAL_S)
-    cap.release()
 
 
 # -------------------------------------------------------------------- main --
@@ -397,18 +434,85 @@ def main():
         sonar = Sonars(enabled=True)
 
     # ---- optional LiDAR / IMU (a failure never stops telemetry) ----------------
-    lidar = imu = ÔıÀşKw{¬ub	êè·[	HâC–ÂY¨×.´7]•æ»ŞÃ‡$TxÕAp…Ë´"fká:ùáZhÇô-ÍX~–Ÿ?=¯µ†ı? ñX *J
-CŠÜ ¤@âÓå}Ÿh·ú~'e˜Åu[²ĞÄ	‚'§\š¸-çÈ†8m²+?ßó€@y;]~lLøáæ÷ªF¢²Ìà£ÙnE<SÕ°Ğƒv/Z8$OOÅôÓme¡Ëòï™Ìúm<SpÖn•1}^
-»Æ4®±©«$
-ûH„_ã×ä±é“v‘(Fõ-ÉTj§rT²£Ë8¾ñ(˜ëé·P»‰'œLĞÌ7|OFŒ.qSû‹îÙ@ÙyÁ’ó®“¬æÙ63lbd¿ï4 eWpøòúC bZ¸ıĞ­êÃÅÚO\OašÊ-„q;‘Ú¤½ˆG»èØ1SÂæ$$gy®Ÿ5ş#‰¥a©2÷_¼ERÀ6ş #–«¼J‚	gïƒÜ½ÛÂwDHÌßz]»zå× (wU0™ıîb§è™Ç8b"•´átô+kÏ¦~¸ŠôQiTVIöŞíÈËš¾WA!ì‘ ŠÜŠ10ŸF+¯ıyLµ¨aÓ?3í*d–r ßÄ|»òäã1I¶İ$>B®…A¡ĞY>„k ‘®Ÿ§üYZÌÆĞ·øÅÀ;gO{i„ï.qe•#%pâ†ºúYÔ6yµ©ó´ç—æÃBlxëÌ-tF–ZJSáÿÕÙZ­˜ñŒJÏ²=j-†8Î-Ó Q§hro²×ğ8¤…wµ²è?	GÖ*~âI Å°ª ¨5Š+úŸ\_”çRTL=ÍŞ÷oóË€ÊlA;˜án€kÕÒ.~¢w±ô%=wOD¢ıôœèƒ³b8áàÂmùHÖ«A]¡Ş×\–±l‡
->¹	}›&ƒÆÉÅ#“ÑZ©(ƒd¼_&û6ätV[®ÈÉÑš÷Äb?hNÙm‹îŒud7'*q@‚µûûĞsºPàì0ë²Ò%œM¯'E®r]1…É¾ªø™S™ƒèË½Ÿn"Œ$<Á,q$^¦Êv`³½Óÿ99x­±¦òã˜çaFmÚäÍ{G4^ERCûÚØø©]Uî9ÂßUküÊ"Îc@™œ€àÌ„jwÖ! s¾õ»!x´ç>«CÙ+ÜæF¡g´¥2¬:‹‰şş[›E	—hˆ¨:¶ßŸ)‚dÍÊ"1ÕU¨Š‡k½ı"ô7Fp2ví@­üV“é!·cšåïÃÏıpIt¯N\
-ÑÖ¸XßÍ•x@G.*~RYáØâİx·Åò—£ç{2<mÀ`ú,kPe¦Ğ[³§§Ä9õ'™Ií¸ò¿†…Œ>H•h)
-…Ó{4¤Ş«ŒHºJ”×0ñÆé%†cv¯=1°î–/d-SqZöûá¤m[´¼òÑîÌÄxKSNÃÔÃÕ‰KInÛu\~êÖ¢,	v÷4–üLf¨é;Ã7c€‘ñ"+¡n¨óP½çVÏ7\,—	³²NÅë‚~¹(Ø‹“Š?ä/ _}C´
-eÜ>±7â+Æ’}¡}À»àÖğ$jm¢…õ¡UfUôMùßOÇÊ8ºX@ƒèÛübúDvÙ¨zc®åé_I@G™Ãû§ÖŒ°8\7âşœÒa—'€_‚P%Àëw#¨¾o¼"=‚7r˜½ÉÊ‘>Ÿ«´$ù0¡S\¯+èL‹½ÓDíqárÊ³´ßaƒ+UÚÑ@­tŠÊ&ijC>öàølÈõÉW4›Ğò"Ox™YqmîüîçU®G ¶’Í»ä¬ØÌA3RwõÜ#j™gqTŒÔË«†(¦ş·,EÌ‰92i³‰;š0ßZºd;¯­¤%¨ÿG…ıçØFµæ1yŠB¿Ñ!r [š Ní…ÄV×bdÏıî¸ÃûÏ8\qtjRjYJÍàâóõ•½l.ïß{÷UÀ¥.@· ±ÊRw‹§bè0Ök•IĞÇª>…ß5´>¡I(”+òz¨¤‡"I¹7hì&½Ó¾Å†¦Z—=ôd‚JQûñ=IZ3¢ÃáaœÖ–Ä\-–àüxvÃÜAc´yŞé+Yd»Æî¢éøûÕLgqn„Ñ;[€T%N÷ñºÄL£|…ç“ã\Áİ+dB6¡0Å.>º~| ¯	ÙŸ%²‹¦äêŒ,_¸²9(-³“OÎÆWQ™}oŒ
- ğ±ò6GÂ©Í¡—ØÖ5Rmgëò8txƒ-JmôˆÕçOÚL7­ÓŒÿí‹ûZr@‘¡+®B0>Ùç¯´bµiõÉ…ör×ÈjrWà¾ ´@ë8+ÊPjß'ÏŠUœÖÊü™\q®§I8Ã½YÛcèADéSzü$¶åvŸä#74Ô¼½†‚¨ø#"Cqş‚ia­;_ÚÀ—aÌGw\ØÌæ…»«y ùš¯Uá%î³;0™¤º"Dbû‰tıq2&ÃdEƒ\îşÑ¿N«É Ä›Ñg>[ÜlØŠ’R1_¬GFú3Íı¨Ğm¨°OçâqòdGîxß(9t%·³Ïw‰¦¸Ò,€õŒV˜jíÊTšoË™!=Å‚Z·OdÀêû—{¸7. ‡½•ò¹¨âW&"Yàcò5éIgAü>ÂŞv…=ÖĞˆ¢\kÚœIÃ§-@ñLÊJ.ß=»±U†éRõÓñÍh£ójlà¤Tª¡d5+´6>Ã“”´xÁw-Ùè–‹Ö‹á.IZ|ÎŒLìQ÷¾o€ğ™;I9nQŒ³Õ²¦¢¦-,ôëm²Ätç	–Jò~3ÕxÅa6Øy©R++—G\ÍçÜ„N±½Ä
-ï%Ñ}Jº[ÆYû“ Æq(Rød_÷gîä¥¡¯O•>%ôÇ 0ƒbŸº80|m(ãÖzİ…¡ßBÁ³ûŸ^9@Í`,7hÿ¦Œ:Ù"ƒŒbp½™Õ"®‡äR·{Ø¾åEÍÉ@ÚGr9ç'
-¦mœX˜xëıòP¯‹qÎû½œ*îÊ9µdqkVÄ$sÉNŸ!÷[è„hÑSÖ®øæ1C´4…Cs%Ú[ì¯a	Òº¬M0­şÊ½»nU7 <k"w™ô¨ÌË™Óˆ‚"¶—U$)îvï\EFpÖşNÃ‰±ÑI2ã2égû­cÜ©“v«ü^€F?õım!àŠÈ¾j1š]Êd‚Â@ßĞüU¨ucß'¥¸:Età›‹Ï²x+šªç¡!øÙ´V]F>íH%À/×¯{}éºØv0·Š•â’
-YÀ4.e«…•7mÄ>òN…UÌ[òğSÑI¢°qº/û§èîĞMdkç=~m†,£xñ‰<òJÛßRÃ@Ø¤‘~ÍÓ4áGhf'ÃV¸Œx†™¡´óú³áëe9Z¹[,-Ä¦–NC+€ŞÜ¡;Œâ´L)}>÷{¢c1?n” ‹ÕÆfÊ~öù@Å¤ÇU²Xß	S»\K$õçà¼…j+î	é}–cÆİ¨v±x7ü
-*Ô\_2KÖä`uÃ“ÅêI(—,ƒ§³‚8õ—OPôñ½¡n7HP"míÏ¨Ö¿§Å…]8O>ZIª™Ğòøzp§àåú²ÛïkDeĞE‚${u®À'#»·‚¼1Ğ_‘YÈÀâšş•?a„.míxrÃ^L˜´ûÓ©0²Z±¯8áã‘-–F§-Èæ†$Wl=viyJÓöóñS¤™ŠÙË´Ìhn+FÓ<¬ËÅ¬3A~şT	[’Ş²	q~çîô\CĞá+æOk´‰*;„ €Ö(µ÷s·?L!TŸ9Ë¢kõ ÕÎjŠnœæ	8ıyƒƒ¯G–ô
-ØOX;¼@¤6¡š#Ö·©måÃèÆÕ\b}‡bw
-"ıı±p]äh×_:¿Â(Ÿ H“Í.S¾í±Ù¿ÌrFÉHóæœPll'RyP§Íóëõ²@Å”8û—ª-Œ25§7`ÖbxIÙ*w˜®èİd‘C¼ûøîÅKZ„4¹$a&®ÚS»­ö‡1¤Ap½”ŞúÆàïqceÊ1œÅŸ)O${=ZSŞ¢ĞèŒ%]şº×EN„Â2ëH‰¹øèÜ¡gbgóYwVÆı« ¼ 4Ÿ6»f¡#ÌÃ>©w‘İ	"‰Bƒ™Û|–î~ãU,oŸMğ¸Î ÏºQŠtè²*!ğ- š¢µíŒ?VUJ~ıeÕôF7ëá1’tkŠÀ—ËßØAdŠ6T/©Ş¨}*bI
+    lidar = imu = None
+    try:
+        if args.sim:
+            lidar, imu = SimLidar(), SimIMU()
+        else:
+            if args.lidar == "tfluna":
+                lidar = TFLuna(args.lidar_port, args.lidar_baud)
+            elif args.lidar == "rplidar":
+                lidar = RPLidar(args.lidar_port, args.lidar_offset)
+            if lidar:
+                lidar.start()
+            if args.imu:
+                imu = make_imu(args.imu_type)
+                imu.start()
+    except Exception as e:
+        print(f"[WARN] extra sensor init failed: {e} (continuing without)")
+
+    stop = threading.Event()
+    if args.camera:
+        threading.Thread(
+            target=camera_loop,
+            args=(server, args.vehicle, args.camera_index, stop),
+            daemon=True,
+        ).start()
+
+    session = requests.Session()
+    if args.api_key:
+        session.headers["X-API-Key"] = args.api_key
+    sent = failed = 0
+    print(f"[NODE] {args.vehicle} -> {server}/update every {SEND_INTERVAL_S}s")
+    try:
+        while True:
+            t0 = time.time()
+            d = sonar.read_cm()
+            g = gps.snapshot() if gps else {"lat": None, "lng": None, "speed": 0.0,
+                                            "heading": None, "valid": False, "sats": 0}
+            payload = {
+                "vehicle_id": args.vehicle,
+                "dist_front": d["front"],
+                "dist_left": d["left"],
+                "dist_right": d["right"],
+                "lat": g["lat"] if g["lat"] is not None else FALLBACK_LAT,
+                "lng": g["lng"] if g["lng"] is not None else FALLBACK_LNG,
+                "speed": round(g["speed"], 1),
+                "gps_valid": g["valid"],
+            }
+            if "rear" in d:
+                payload["dist_rear"] = d["rear"]
+            if g["heading"] is not None:
+                payload["heading"] = round(g["heading"], 1)
+            payload["node"] = args.node
+            if lidar:
+                payload["lidar"] = lidar.snapshot()
+            if imu:
+                payload["imu"] = imu.snapshot()
+
+            try:
+                r = session.post(f"{server}/update", json=payload, timeout=3)
+                r.raise_for_status()
+                sent += 1
+                if sent % 5 == 1:
+                    j = r.json()
+                    lz = payload.get("lidar", {}).get("front_cm")
+                    iu = payload.get("imu", {})
+                    print(f"[OK] #{sent} sonar F/L/R/B={d['front']}/{d['left']}/{d['right']}/{d.get('rear', '-')}cm lidar={lz}cm "
+                          f"imu={iu.get('pitch')}/{iu.get('roll')}deg {iu.get('accel_g')}g gps={'FIX' if g['valid'] else 'none'}"
+                          f"/{g['sats']}sat spd={payload['speed']} zone={j.get('zone')} "
+                          f"risk={j.get('risk_score')}")
+            except requests.RequestException as e:
+                failed += 1
+                code = getattr(getattr(e, "response", None), "status_code", None)
+                hint = "  <- wrong/missing API key (--api-key)" if code == 401 else ""
+                print(f"[FAIL] #{failed} {e}{hint}")
+
+            time.sleep(max(0.0, SEND_INTERVAL_S - (time.time() - t0)))
+    except KeyboardInterrupt:
+        print("\n[NODE] stopped")
+        stop.set()
+
+
+if __name__ == "__main__":
+    main()
