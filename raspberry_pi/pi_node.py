@@ -9,7 +9,7 @@ truck on the dashboard.
   GPS (NEO-6M/8M/F9P over UART)  -> lat, lng, speed, heading, gps_valid
   3x HC-SR04 ultrasonic (GPIO)   -> dist_front / dist_left / dist_right  (cm)
   LiDAR (TF-Luna/TFmini/RPLIDAR) -> lidar {front_cm,...}   (--lidar tfluna|rplidar)
-  IMU (MPU6050 over I2C)         -> imu {pitch,roll,accel_g,...}   (--imu)
+  IMU (BNO055/MPU6050, I2C)       -> imu {pitch,roll,accel_g,...}   (--imu)
   Pi camera / USB webcam         -> /api/camera/upload  (optional, --camera)
 
 The Pi identifies itself as node "PI" (PRIMARY). An ESP32 running the updated
@@ -32,7 +32,7 @@ import time
 
 import requests
 
-from pi_sensors import MPU6050, RPLidar, SimIMU, SimLidar, TFLuna
+from pi_sensors import RPLidar, SimIMU, SimLidar, TFLuna, make_imu
 
 # ---------------------------------------------------------------- defaults --
 # Every value can be overridden with a CLI flag or an environment variable.
@@ -49,6 +49,7 @@ SONAR_PINS = {
     "front": (23, 24),  # (TRIG, ECHO)
     "left": (17, 27),
     "right": (5, 6),
+    "rear": (16, 26),   # pin 36 TRIG, pin 37 ECHO
 }
 NO_ECHO_CM = 250  # value sent when nothing is in range (matches ESP32 firmware)
 
@@ -176,7 +177,7 @@ class Sonars:
 
     def read_cm(self):
         out = {}
-        for name in ("front", "left", "right"):
+        for name in ("front", "left", "right", "rear"):
             s = self.sensors.get(name)
             if s is None:
                 out[name] = NO_ECHO_CM
@@ -184,6 +185,71 @@ class Sonars:
             cm = int(s.distance * 100)
             out[name] = NO_ECHO_CM if cm >= 245 else max(cm, 2)
         return out
+
+
+class EspSonars(threading.Thread):
+    """4x HC-SR04 read by an ESP32 (esp32_sonar_node.ino) and sent over USB as
+    lines like:  SONAR,front,left,right,rear   (cm, 250 = nothing in range)."""
+
+    STALE_S = 1.5   # older than this -> report "no echo" instead of a frozen value
+
+    def __init__(self, port="auto", baud=115200, exclude=()):
+        super().__init__(daemon=True)
+        self.port, self.baud = port, baud
+        self.exclude = {os.path.realpath(p) for p in exclude if p}
+        self._lock = threading.Lock()
+        self._d = None
+        self._ts = 0.0
+        self.start()
+
+    def _candidates(self):
+        import glob
+        if self.port != "auto":
+            return [self.port]
+        seen, out = set(), []
+        for p in sorted(glob.glob("/dev/serial/by-id/*")) + sorted(
+                glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*")):
+            rp = os.path.realpath(p)
+            if rp in seen or rp in self.exclude:
+                continue
+            seen.add(rp)
+            out.append(p)
+        return out
+
+    def run(self):
+        import serial
+        while True:
+            for port in self._candidates():
+                try:
+                    with serial.Serial(port, self.baud, timeout=1) as ser:
+                        ok_until = time.time() + 4      # ESP32 reboots when the port opens
+                        announced = False
+                        while True:
+                            ln = ser.readline().decode("ascii", errors="ignore").strip()
+                            if ln.startswith("SONAR,"):
+                                try:
+                                    f, l, r, b = (int(x) for x in ln.split(",")[1:5])
+                                except ValueError:
+                                    continue
+                                if not announced:
+                                    print(f"[SONAR] ESP32 on {port}: front, left, right, rear")
+                                    announced = True
+                                with self._lock:
+                                    self._d = {"front": f, "left": l, "right": r, "rear": b}
+                                    self._ts = time.time()
+                                ok_until = time.time() + 4
+                            elif time.time() > ok_until:
+                                break       # not the ESP32 (or it stopped talking)
+                except Exception:
+                    pass
+            print("[SONAR] no ESP32 sonar data yet (check USB cable / --esp-port) - retrying in 3 s")
+            time.sleep(3)
+
+    def read_cm(self):
+        with self._lock:
+            if self._d is None or time.time() - self._ts > self.STALE_S:
+                return {k: NO_ECHO_CM for k in ("front", "left", "right", "rear")}
+            return dict(self._d)
 
 
 class SimSonars:
@@ -235,12 +301,19 @@ def main():
     ap.add_argument("--sim", action="store_true", help="fake GPS + sonar, no hardware")
     ap.add_argument("--no-gps", action="store_true", help="use fallback coordinates")
     ap.add_argument("--no-sonar", action="store_true", help="skip ultrasonic sensors")
+    ap.add_argument("--sonar-source", choices=["esp32", "gpio"],
+                    default=os.environ.get("SONAR_SOURCE", "gpio"),
+                    help="gpio = 4 sonars on Pi pins (default), esp32 = 4 sonars on an ESP32 over USB")
+    ap.add_argument("--esp-port", default=os.environ.get("ESP_PORT", "auto"),
+                    help="ESP32 serial port, e.g. /dev/serial/by-id/usb-... (auto = find it)")
     ap.add_argument("--lidar", choices=["none", "tfluna", "rplidar"], default="none")
     ap.add_argument("--lidar-port", default=os.environ.get("LIDAR_PORT", "/dev/ttyUSB0"))
     ap.add_argument("--lidar-baud", type=int, default=115200)
     ap.add_argument("--lidar-offset", type=float, default=0.0,
                     help="RPLIDAR: degrees to rotate so 0 = straight ahead")
-    ap.add_argument("--imu", action="store_true", help="enable MPU6050 on I2C bus 1")
+    ap.add_argument("--imu", action="store_true", help="enable the IMU on I2C bus 1")
+    ap.add_argument("--imu-type", choices=["bno055", "mpu6050"],
+                    default=os.environ.get("IMU_TYPE", "bno055"))
     ap.add_argument("--node", default=os.environ.get("HAUL_NODE", "PI"),
                     help="node name sent to the server (PI = primary)")
     ap.add_argument("--camera", action="store_true", help="stream camera frames")
@@ -252,7 +325,15 @@ def main():
     if gps is None and not args.no_gps:
         gps = GPSReader(GPS_PORT, GPS_BAUD)
         gps.start()
-    sonar = SimSonars() if args.sim else Sonars(enabled=not args.no_sonar)
+    if args.sim:
+        sonar = SimSonars()
+    elif args.no_sonar:
+        sonar = Sonars(enabled=False)
+    elif args.sonar_source == "esp32":
+        excl = [args.lidar_port] if args.lidar != "none" else []
+        sonar = EspSonars(args.esp_port, exclude=excl)
+    else:
+        sonar = Sonars(enabled=True)
 
     # ---- optional LiDAR / IMU (a failure never stops telemetry) ----------------
     lidar = imu = None
@@ -267,7 +348,7 @@ def main():
             if lidar:
                 lidar.start()
             if args.imu:
-                imu = MPU6050()
+                imu = make_imu(args.imu_type)
                 imu.start()
     except Exception as e:
         print(f"[WARN] extra sensor init failed: {e} (continuing without)")
@@ -301,6 +382,8 @@ def main():
                 "speed": round(g["speed"], 1),
                 "gps_valid": g["valid"],
             }
+            if "rear" in d:
+                payload["dist_rear"] = d["rear"]
             if g["heading"] is not None:
                 payload["heading"] = round(g["heading"], 1)
             payload["node"] = args.node
@@ -317,7 +400,7 @@ def main():
                     j = r.json()
                     lz = payload.get("lidar", {}).get("front_cm")
                     iu = payload.get("imu", {})
-                    print(f"[OK] #{sent} front={d['front']}cm lidar={lz}cm "
+                    print(f"[OK] #{sent} sonar F/L/R/B={d['front']}/{d['left']}/{d['right']}/{d.get('rear', '-')}cm lidar={lz}cm "
                           f"imu={iu.get('pitch')}/{iu.get('roll')}deg {iu.get('accel_g')}g gps={'FIX' if g['valid'] else 'none'}"
                           f"/{g['sats']}sat spd={payload['speed']} zone={j.get('zone')} "
                           f"risk={j.get('risk_score')}")

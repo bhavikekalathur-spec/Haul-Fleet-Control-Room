@@ -4,7 +4,8 @@ Wiring checks - test ONE sensor at a time while you build.
 
   python3 hw_check.py imu
   python3 hw_check.py gps
-  python3 hw_check.py sonar
+  python3 hw_check.py sonar                       (4 sonars on Pi pins)
+  python3 hw_check.py sonar --sonar-source esp32  (4 sonars on an ESP32 over USB)
   python3 hw_check.py lidar --type tfluna --port /dev/ttyUSB0
   python3 hw_check.py camera
 """
@@ -13,13 +14,13 @@ import sys
 import time
 
 
-def check_imu():
-    from pi_sensors import MPU6050
-    m = MPU6050()
+def check_imu(kind):
+    from pi_sensors import make_imu
+    m = make_imu(kind)
     m.start()
     print("IMU: keep still 2 s (calibrating), then TILT the board left/right/forward.")
     print("PASS = pitch/roll change when you tilt, accel_g ~ 1.00 at rest.\n")
-    time.sleep(2.5)
+    time.sleep(3.5)
     for _ in range(20):
         d = m.snapshot()
         if not d.get("ok"):
@@ -62,14 +63,17 @@ def check_gps():
     print("No fix after 3 min - move the antenna outdoors/near a window.")
 
 
-def check_sonar():
-    from pi_node import SONAR_PINS, Sonars
-    s = Sonars(enabled=True)
+def check_sonar(source, esp_port):
+    from pi_node import EspSonars, Sonars
+    s = EspSonars(esp_port) if source == "esp32" else Sonars(enabled=True)
+    if source == "esp32":
+        time.sleep(4)   # ESP32 restarts when the port opens
     print("SONAR: hold your hand ~20 cm in front of ONE sensor at a time.")
     print("PASS = only that sensor's number drops. 250 = nothing in range.\n")
     for _ in range(30):
         d = s.read_cm()
-        print(f"  front={d['front']:4d}  left={d['left']:4d}  right={d['right']:4d}  cm")
+        print(f"  front={d['front']:4d}  left={d['left']:4d}  right={d['right']:4d}"
+              f"  rear={d.get('rear', '-')!s:>4}  cm")
         time.sleep(0.4)
 
 
@@ -101,10 +105,13 @@ if __name__ == "__main__":
     ap.add_argument("sensor", choices=["imu", "gps", "sonar", "lidar", "camera"])
     ap.add_argument("--type", choices=["tfluna", "rplidar"], default="tfluna")
     ap.add_argument("--port", default="/dev/ttyUSB0")
+    ap.add_argument("--sonar-source", choices=["esp32", "gpio"], default="gpio")
+    ap.add_argument("--esp-port", default="auto")
+    ap.add_argument("--imu-type", choices=["bno055", "mpu6050"], default="bno055")
     ap.add_argument("--camera-index", type=int, default=0)
     a = ap.parse_args()
     try:
-        {"imu": check_imu, "gps": check_gps, "sonar": check_sonar,
+        {"imu": lambda: check_imu(a.imu_type), "gps": check_gps, "sonar": lambda: check_sonar(a.sonar_source, a.esp_port),
          "lidar": lambda: check_lidar(a.type, a.port),
          "camera": lambda: check_camera(a.camera_index)}[a.sensor]()
     except KeyboardInterrupt:

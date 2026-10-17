@@ -2824,6 +2824,12 @@ def update_telemetry():
         v["dist_front"] = front
         v["dist_left"] = left
         v["dist_right"] = right
+        if "dist_rear" in data:
+            try:
+                v["dist_rear"] = int(data["dist_rear"])
+                sensors["rear_ultrasonic_cm"] = v["dist_rear"]
+            except (TypeError, ValueError):
+                pass
         v["action"] = action
         v["last_update"] = now_str
         v["last_update_ts"] = time.time()

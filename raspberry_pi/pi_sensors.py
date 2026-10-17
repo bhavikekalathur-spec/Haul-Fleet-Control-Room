@@ -3,7 +3,8 @@ LiDAR + IMU drivers for pi_node.py
 ==================================
 LiDAR   TFLuna    - Benewake TF-Luna / TFmini / TFmini-S (UART, single-point, cm)
         RPLidar   - Slamtec RPLIDAR A1/A2/C1 (USB, 360 deg scanner)  [pip install rplidar-roboticia]
-IMU     MPU6050   - I2C 0x68 (also works with MPU6500/9250 accel+gyro)  [pip install smbus2]
+IMU     BNO055    - I2C 0x28/0x29 (default, --imu-type bno055)
+        MPU6050   - I2C 0x68 (also works with MPU6500/9250 accel+gyro)  [pip install smbus2]
 
 Every driver runs in its own thread and exposes snapshot() -> dict, so a slow or
 failed sensor can never block the telemetry loop.
@@ -205,6 +206,109 @@ class MPU6050(_Worker):
             d["accel_g"] = round(self._peak_g, 2)
             self._peak_g = 1.0
         return d
+
+
+class BNO055(_Worker):
+    """Bosch BNO055 9-axis IMU (Adafruit / 7SEMI / CJMCU boards) over I2C.
+
+    Default address 0x28 (ADD/ADR pin low) or 0x29 (ADD high) - auto-detected.
+    Runs in IMUPLUS mode (accel + gyro fusion, magnetometer off): pitch/roll are
+    stable and nothing needs a figure-8 calibration, and nearby motors/steel
+    cannot disturb it. Same snapshot() keys as MPU6050, so the server needs no
+    changes.
+    """
+    CHIP_ID = 0xA0
+    REG_CHIP_ID, REG_PAGE, REG_UNIT_SEL = 0x00, 0x07, 0x3B
+    REG_OPR_MODE, REG_PWR_MODE, REG_SYS_TRIGGER = 0x3D, 0x3E, 0x3F
+    MODE_CONFIG, MODE_IMUPLUS = 0x00, 0x08
+
+    def __init__(self, bus=1, addr=None, rate_hz=50):
+        super().__init__()
+        self.bus_id, self.addr, self.dt = bus, addr, 1.0 / rate_hz
+        self._peak_g = 1.0
+        self._peak_lock = threading.Lock()
+
+    @staticmethod
+    def _s16(lo, hi):
+        v = (hi << 8) | lo
+        return v - 65536 if v & 0x8000 else v
+
+    def _find(self, bus):
+        for a in ([self.addr] if self.addr else [0x28, 0x29]):
+            try:
+                if bus.read_byte_data(a, self.REG_CHIP_ID) == self.CHIP_ID:
+                    return a
+            except OSError:
+                pass
+        raise OSError("BNO055 not found at 0x28/0x29 - check wiring (sudo i2cdetect -y 1)")
+
+    def _setup(self, bus, a):
+        bus.write_byte_data(a, self.REG_OPR_MODE, self.MODE_CONFIG)
+        time.sleep(0.03)
+        bus.write_byte_data(a, self.REG_SYS_TRIGGER, 0x20)   # reset
+        time.sleep(0.7)
+        for _ in range(20):                                  # wait for it to boot
+            try:
+                if bus.read_byte_data(a, self.REG_CHIP_ID) == self.CHIP_ID:
+                    break
+            except OSError:
+                pass
+            time.sleep(0.05)
+        bus.write_byte_data(a, self.REG_PWR_MODE, 0x00)      # normal power
+        bus.write_byte_data(a, self.REG_PAGE, 0x00)
+        bus.write_byte_data(a, self.REG_UNIT_SEL, 0x00)      # m/s2, dps, degrees, C
+        bus.write_byte_data(a, self.REG_SYS_TRIGGER, 0x00)
+        time.sleep(0.01)
+        bus.write_byte_data(a, self.REG_OPR_MODE, self.MODE_IMUPLUS)
+        time.sleep(0.03)
+
+    def _read(self, bus, a):
+        r = bus.read_i2c_block_data(a, 0x08, 24)   # accel, mag, gyro, euler
+        ax, ay, az = (self._s16(r[i], r[i + 1]) / 100.0 / 9.80665 for i in (0, 2, 4))
+        gx, gy, gz = (self._s16(r[i], r[i + 1]) / 16.0 for i in (12, 14, 16))
+        heading, roll, pitch = (self._s16(r[i], r[i + 1]) / 16.0 for i in (18, 20, 22))
+        t = bus.read_i2c_block_data(a, 0x34, 2)    # temp, calib status
+        temp = t[0] - 256 if t[0] > 127 else t[0]
+        return ax, ay, az, gx, gy, gz, heading, roll, pitch, temp, t[1]
+
+    def run(self):
+        from smbus2 import SMBus
+        while True:
+            try:
+                with SMBus(self.bus_id) as bus:
+                    a = self._find(bus)
+                    self._setup(bus, a)
+                    print(f"[IMU] BNO055 ready @ 0x{a:02X} (IMUPLUS mode)")
+                    while True:
+                        ax, ay, az, gx, gy, gz, hd, roll, pitch, temp, cal = self._read(bus, a)
+                        now = time.time()
+                        g_total = math.sqrt(ax * ax + ay * ay + az * az)
+                        with self._peak_lock:
+                            self._peak_g = max(self._peak_g, g_total)
+                        self._set({"ok": True, "sensor": "BNO055",
+                                   "ax": round(ax, 3), "ay": round(ay, 3), "az": round(az, 3),
+                                   "gx": round(gx, 1), "gy": round(gy, 1), "gz": round(gz, 1),
+                                   "pitch": round(pitch, 1), "roll": round(roll, 1),
+                                   "heading": round(hd, 1), "temp_c": temp,
+                                   "calib": {"sys": cal >> 6 & 3, "gyro": cal >> 4 & 3,
+                                             "accel": cal >> 2 & 3},
+                                   "ts": now})
+                        time.sleep(self.dt)
+            except Exception as e:
+                self._set({"ok": False})
+                print(f"[IMU] {e} - retrying in 3 s")
+                time.sleep(3)
+
+    def snapshot(self):
+        d = super().snapshot()
+        with self._peak_lock:
+            d["accel_g"] = round(self._peak_g, 2)
+            self._peak_g = 1.0
+        return d
+
+
+def make_imu(kind="bno055"):
+    return MPU6050() if kind == "mpu6050" else BNO055()
 
 
 class SimIMU:
