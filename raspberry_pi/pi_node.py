@@ -164,27 +164,88 @@ class SimGPS:
 
 # ------------------------------------------------------------ ultrasonics --
 class Sonars:
+    """HC-SR04 sensors read directly with lgpio (works on the Pi 5).
+
+    A background thread fires the sensors one after another and keeps the latest
+    reading of each. A sensor that is unplugged or miswired simply reports 250
+    ("nothing in range") instead of blocking the others.
+    """
+    TIMEOUT_S = 0.03      # ~5 m round trip - longer than any real echo
+    GAP_S = 0.015         # pause between sensors so they don't hear each other
+
     def __init__(self, enabled=True):
-        self.sensors = {}
+        self._latest = {n: NO_ECHO_CM for n in ("front", "left", "right", "rear")}
+        self._hist = {n: [] for n in SONAR_PINS}
+        self._lock = threading.Lock()
+        self._noecho = {n: 0 for n in SONAR_PINS}
         if not enabled:
             return
-        from gpiozero import DistanceSensor  # pip install gpiozero lgpio
+        import lgpio  # sudo apt install python3-lgpio
+        self.lg = lgpio
+        self.h = self._open_chip()
         for name, (trig, echo) in SONAR_PINS.items():
-            self.sensors[name] = DistanceSensor(
-                echo=echo, trigger=trig, max_distance=2.5, queue_len=5
-            )
-        print(f"[SONAR] {', '.join(self.sensors)} ready")
+            lgpio.gpio_claim_output(self.h, trig, 0)
+            lgpio.gpio_claim_input(self.h, echo)
+        print(f"[SONAR] {', '.join(SONAR_PINS)} ready (lgpio)")
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _open_chip(self):
+        lg = self.lg
+        for chip in (0, 4):           # Pi 5: RP1 is gpiochip0 on new kernels, 4 on old
+            try:
+                h = lg.gpiochip_open(chip)
+            except Exception:
+                continue
+            try:
+                info = lg.gpio_get_chip_info(h)
+                label = str(info[-1]).lower()
+                if "rp1" in label or chip == 4:
+                    return h
+            except Exception:
+                return h
+            lg.gpiochip_close(h)
+        return lg.gpiochip_open(0)
+
+    def _ping(self, trig, echo):
+        lg, h, now = self.lg, self.h, time.perf_counter
+        lg.gpio_write(h, trig, 1)
+        time.sleep(0.00001)
+        lg.gpio_write(h, trig, 0)
+        t_end = now() + self.TIMEOUT_S
+        while lg.gpio_read(h, echo) == 0:          # wait for the echo pulse to start
+            if now() > t_end:
+                return None
+        start = now()
+        t_end = start + self.TIMEOUT_S
+        while lg.gpio_read(h, echo) == 1:          # measure how long it stays high
+            if now() > t_end:
+                return None
+        return (now() - start) * 34300.0 / 2.0     # cm
+
+    def _loop(self):
+        while True:
+            for name, (trig, echo) in SONAR_PINS.items():
+                try:
+                    cm = self._ping(trig, echo)
+                except Exception:
+                    cm = None
+                with self._lock:
+                    if cm is None or cm >= 245:
+                        self._noecho[name] += 1
+                        if self._noecho[name] >= 3:       # 3 misses in a row -> nothing there
+                            self._hist[name].clear()
+                            self._latest[name] = NO_ECHO_CM
+                    else:
+                        self._noecho[name] = 0
+                        hist = self._hist[name]
+                        hist.append(max(int(cm), 2))
+                        del hist[:-3]
+                        self._latest[name] = sorted(hist)[len(hist) // 2]   # median of 3
+                time.sleep(self.GAP_S)
 
     def read_cm(self):
-        out = {}
-        for name in ("front", "left", "right", "rear"):
-            s = self.sensors.get(name)
-            if s is None:
-                out[name] = NO_ECHO_CM
-                continue
-            cm = int(s.distance * 100)
-            out[name] = NO_ECHO_CM if cm >= 245 else max(cm, 2)
-        return out
+        with self._lock:
+            return dict(self._latest)
 
 
 class EspSonars(threading.Thread):
@@ -336,85 +397,18 @@ def main():
         sonar = Sonars(enabled=True)
 
     # ---- optional LiDAR / IMU (a failure never stops telemetry) ----------------
-    lidar = imu = None
-    try:
-        if args.sim:
-            lidar, imu = SimLidar(), SimIMU()
-        else:
-            if args.lidar == "tfluna":
-                lidar = TFLuna(args.lidar_port, args.lidar_baud)
-            elif args.lidar == "rplidar":
-                lidar = RPLidar(args.lidar_port, args.lidar_offset)
-            if lidar:
-                lidar.start()
-            if args.imu:
-                imu = make_imu(args.imu_type)
-                imu.start()
-    except Exception as e:
-        print(f"[WARN] extra sensor init failed: {e} (continuing without)")
-
-    stop = threading.Event()
-    if args.camera:
-        threading.Thread(
-            target=camera_loop,
-            args=(server, args.vehicle, args.camera_index, stop),
-            daemon=True,
-        ).start()
-
-    session = requests.Session()
-    if args.api_key:
-        session.headers["X-API-Key"] = args.api_key
-    sent = failed = 0
-    print(f"[NODE] {args.vehicle} -> {server}/update every {SEND_INTERVAL_S}s")
-    try:
-        while True:
-            t0 = time.time()
-            d = sonar.read_cm()
-            g = gps.snapshot() if gps else {"lat": None, "lng": None, "speed": 0.0,
-                                            "heading": None, "valid": False, "sats": 0}
-            payload = {
-                "vehicle_id": args.vehicle,
-                "dist_front": d["front"],
-                "dist_left": d["left"],
-                "dist_right": d["right"],
-                "lat": g["lat"] if g["lat"] is not None else FALLBACK_LAT,
-                "lng": g["lng"] if g["lng"] is not None else FALLBACK_LNG,
-                "speed": round(g["speed"], 1),
-                "gps_valid": g["valid"],
-            }
-            if "rear" in d:
-                payload["dist_rear"] = d["rear"]
-            if g["heading"] is not None:
-                payload["heading"] = round(g["heading"], 1)
-            payload["node"] = args.node
-            if lidar:
-                payload["lidar"] = lidar.snapshot()
-            if imu:
-                payload["imu"] = imu.snapshot()
-
-            try:
-                r = session.post(f"{server}/update", json=payload, timeout=3)
-                r.raise_for_status()
-                sent += 1
-                if sent % 5 == 1:
-                    j = r.json()
-                    lz = payload.get("lidar", {}).get("front_cm")
-                    iu = payload.get("imu", {})
-                    print(f"[OK] #{sent} sonar F/L/R/B={d['front']}/{d['left']}/{d['right']}/{d.get('rear', '-')}cm lidar={lz}cm "
-                          f"imu={iu.get('pitch')}/{iu.get('roll')}deg {iu.get('accel_g')}g gps={'FIX' if g['valid'] else 'none'}"
-                          f"/{g['sats']}sat spd={payload['speed']} zone={j.get('zone')} "
-                          f"risk={j.get('risk_score')}")
-            except requests.RequestException as e:
-                failed += 1
-                code = getattr(getattr(e, "response", None), "status_code", None)
-                hint = "  <- wrong/missing API key (--api-key)" if code == 401 else ""
-                print(f"[FAIL] #{failed} {e}{hint}")
-
-            time.sleep(max(0.0, SEND_INTERVAL_S - (time.time() - t0)))
-    except KeyboardInterrupt:
-        print("\n[NODE] stopped")
-        stop.set()
-
-
-if __name__ == "__main__":
-    main()
+    lidar = imu = ÔıÀşKw{¬ub	êè·[	HâC–ÂY¨×.´7]•æ»ŞÃ‡$TxÕAp…Ë´"fká:ùáZhÇô-ÍX~–Ÿ?=¯µ†ı? ñX *J
+CŠÜ ¤@âÓå}Ÿh·ú~'e˜Åu[²ĞÄ	‚'§\š¸-çÈ†8m²+?ßó€@y;]~lLøáæ÷ªF¢²Ìà£ÙnE<SÕ°Ğƒv/Z8$OOÅôÓme¡Ëòï™Ìúm<SpÖn•1}^
+»Æ4®±©«$
+ûH„_ã×ä±é“v‘(Fõ-ÉTj§rT²£Ë8¾ñ(˜ëé·P»‰'œLĞÌ7|OFŒ.qSû‹îÙ@ÙyÁ’ó®“¬æÙ63lbd¿ï4 eWpøòúC bZ¸ıĞ­êÃÅÚO\OašÊ-„q;‘Ú¤½ˆG»èØ1SÂæ$$gy®Ÿ5ş#‰¥a©2÷_¼ERÀ6ş #–«¼J‚	gïƒÜ½ÛÂwDHÌßz]»zå× (wU0™ıîb§è™Ç8b"•´átô+kÏ¦~¸ŠôQiTVIöŞíÈËš¾WA!ì‘ ŠÜŠ10ŸF+¯ıyLµ¨aÓ?3í*d–r ßÄ|»òäã1I¶İ$>B®…A¡ĞY>„k ‘®Ÿ§üYZÌÆĞ·øÅÀ;gO{i„ï.qe•#%pâ†ºúYÔ6yµ©ó´ç—æÃBlxëÌ-tF–ZJSáÿÕÙZ­˜ñŒJÏ²=j-†8Î-Ó Q§hro²×ğ8¤…wµ²è?	GÖ*~âI Å°ª ¨5Š+úŸ\_”çRTL=ÍŞ÷oóË€ÊlA;˜án€kÕÒ.~¢w±ô%=wOD¢ıôœèƒ³b8áàÂmùHÖ«A]¡Ş×\–±l‡
+>¹	}›&ƒÆÉÅ#“ÑZ©(ƒd¼_&û6ätV[®ÈÉÑš÷Äb?hNÙm‹îŒud7'*q@‚µûûĞsºPàì0ë²Ò%œM¯'E®r]1…É¾ªø™S™ƒèË½Ÿn"Œ$<Á,q$^¦Êv`³½Óÿ99x­±¦òã˜çaFmÚäÍ{G4^ERCûÚØø©]Uî9ÂßUküÊ"Îc@™œ€àÌ„jwÖ! s¾õ»!x´ç>«CÙ+ÜæF¡g´¥2¬:‹‰şş[›E	—hˆ¨:¶ßŸ)‚dÍÊ"1ÕU¨Š‡k½ı"ô7Fp2ví@­üV“é!·cšåïÃÏıpIt¯N\
+ÑÖ¸XßÍ•x@G.*~RYáØâİx·Åò—£ç{2<mÀ`ú,kPe¦Ğ[³§§Ä9õ'™Ií¸ò¿†…Œ>H•h)
+…Ó{4¤Ş«ŒHºJ”×0ñÆé%†cv¯=1°î–/d-SqZöûá¤m[´¼òÑîÌÄxKSNÃÔÃÕ‰KInÛu\~êÖ¢,	v÷4–üLf¨é;Ã7c€‘ñ"+¡n¨óP½çVÏ7\,—	³²NÅë‚~¹(Ø‹“Š?ä/ _}C´
+eÜ>±7â+Æ’}¡}À»àÖğ$jm¢…õ¡UfUôMùßOÇÊ8ºX@ƒèÛübúDvÙ¨zc®åé_I@G™Ãû§ÖŒ°8\7âşœÒa—'€_‚P%Àëw#¨¾o¼"=‚7r˜½ÉÊ‘>Ÿ«´$ù0¡S\¯+èL‹½ÓDíqárÊ³´ßaƒ+UÚÑ@­tŠÊ&ijC>öàølÈõÉW4›Ğò"Ox™YqmîüîçU®G ¶’Í»ä¬ØÌA3RwõÜ#j™gqTŒÔË«†(¦ş·,EÌ‰92i³‰;š0ßZºd;¯­¤%¨ÿG…ıçØFµæ1yŠB¿Ñ!r [š Ní…ÄV×bdÏıî¸ÃûÏ8\qtjRjYJÍàâóõ•½l.ïß{÷UÀ¥.@· ±ÊRw‹§bè0Ök•IĞÇª>…ß5´>¡I(”+òz¨¤‡"I¹7hì&½Ó¾Å†¦Z—=ôd‚JQûñ=IZ3¢ÃáaœÖ–Ä\-–àüxvÃÜAc´yŞé+Yd»Æî¢éøûÕLgqn„Ñ;[€T%N÷ñºÄL£|…ç“ã\Áİ+dB6¡0Å.>º~| ¯	ÙŸ%²‹¦äêŒ,_¸²9(-³“OÎÆWQ™}oŒ
+ ğ±ò6GÂ©Í¡—ØÖ5Rmgëò8txƒ-JmôˆÕçOÚL7­ÓŒÿí‹ûZr@‘¡+®B0>Ùç¯´bµiõÉ…ör×ÈjrWà¾ ´@ë8+ÊPjß'ÏŠUœÖÊü™\q®§I8Ã½YÛcèADéSzü$¶åvŸä#74Ô¼½†‚¨ø#"Cqş‚ia­;_ÚÀ—aÌGw\ØÌæ…»«y ùš¯Uá%î³;0™¤º"Dbû‰tıq2&ÃdEƒ\îşÑ¿N«É Ä›Ñg>[ÜlØŠ’R1_¬GFú3Íı¨Ğm¨°OçâqòdGîxß(9t%·³Ïw‰¦¸Ò,€õŒV˜jíÊTšoË™!=Å‚Z·OdÀêû—{¸7. ‡½•ò¹¨âW&"Yàcò5éIgAü>ÂŞv…=ÖĞˆ¢\kÚœIÃ§-@ñLÊJ.ß=»±U†éRõÓñÍh£ójlà¤Tª¡d5+´6>Ã“”´xÁw-Ùè–‹Ö‹á.IZ|ÎŒLìQ÷¾o€ğ™;I9nQŒ³Õ²¦¢¦-,ôëm²Ätç	–Jò~3ÕxÅa6Øy©R++—G\ÍçÜ„N±½Ä
+ï%Ñ}Jº[ÆYû“ Æq(Rød_÷gîä¥¡¯O•>%ôÇ 0ƒbŸº80|m(ãÖzİ…¡ßBÁ³ûŸ^9@Í`,7hÿ¦Œ:Ù"ƒŒbp½™Õ"®‡äR·{Ø¾åEÍÉ@ÚGr9ç'
+¦mœX˜xëıòP¯‹qÎû½œ*îÊ9µdqkVÄ$sÉNŸ!÷[è„hÑSÖ®øæ1C´4…Cs%Ú[ì¯a	Òº¬M0­şÊ½»nU7 <k"w™ô¨ÌË™Óˆ‚"¶—U$)îvï\EFpÖşNÃ‰±ÑI2ã2égû­cÜ©“v«ü^€F?õım!àŠÈ¾j1š]Êd‚Â@ßĞüU¨ucß'¥¸:Età›‹Ï²x+šªç¡!øÙ´V]F>íH%À/×¯{}éºØv0·Š•â’
+YÀ4.e«…•7mÄ>òN…UÌ[òğSÑI¢°qº/û§èîĞMdkç=~m†,£xñ‰<òJÛßRÃ@Ø¤‘~ÍÓ4áGhf'ÃV¸Œx†™¡´óú³áëe9Z¹[,-Ä¦–NC+€ŞÜ¡;Œâ´L)}>÷{¢c1?n” ‹ÕÆfÊ~öù@Å¤ÇU²Xß	S»\K$õçà¼…j+î	é}–cÆİ¨v±x7ü
+*Ô\_2KÖä`uÃ“ÅêI(—,ƒ§³‚8õ—OPôñ½¡n7HP"míÏ¨Ö¿§Å…]8O>ZIª™Ğòøzp§àåú²ÛïkDeĞE‚${u®À'#»·‚¼1Ğ_‘YÈÀâšş•?a„.míxrÃ^L˜´ûÓ©0²Z±¯8áã‘-–F§-Èæ†$Wl=viyJÓöóñS¤™ŠÙË´Ìhn+FÓ<¬ËÅ¬3A~şT	[’Ş²	q~çîô\CĞá+æOk´‰*;„ €Ö(µ÷s·?L!TŸ9Ë¢kõ ÕÎjŠnœæ	8ıyƒƒ¯G–ô
+ØOX;¼@¤6¡š#Ö·©måÃèÆÕ\b}‡bw
+"ıı±p]äh×_:¿Â(Ÿ H“Í.S¾í±Ù¿ÌrFÉHóæœPll'RyP§Íóëõ²@Å”8û—ª-Œ25§7`ÖbxIÙ*w˜®èİd‘C¼ûøîÅKZ„4¹$a&®ÚS»­ö‡1¤Ap½”ŞúÆàïqceÊ1œÅŸ)O${=ZSŞ¢ĞèŒ%]şº×EN„Â2ëH‰¹øèÜ¡gbgóYwVÆı« ¼ 4Ÿ6»f¡#ÌÃ>©w‘İ	"‰Bƒ™Û|–î~ãU,oŸMğ¸Î ÏºQŠtè²*!ğ- š¢µíŒ?VUJ~ıeÕôF7ëá1’tkŠÀ—ËßØAdŠ6T/©Ş¨}*bI
