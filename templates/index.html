@@ -2545,6 +2545,37 @@
         </div>
       </div>
 
+      <!-- ACCORDION: LIDAR 360 SCAN (RPLIDAR on the Pi) -->
+      <div class="ops-accordion" id="accLidar">
+        <div class="ops-accordion-hdr" onclick="toggleOpsAccordion('accLidar')">
+          <span>📡 LiDAR 360° Scan</span>
+          <span class="ops-accordion-arrow">▼</span>
+        </div>
+        <div class="ops-accordion-body">
+          <div style="display:flex;justify-content:space-between;align-items:center;font-size:11px;margin-bottom:6px">
+            <span id="lidarStatus" style="font-weight:600;color:var(--text-secondary)">Waiting for LiDAR…</span>
+            <label style="color:var(--text-secondary)">Range
+              <select id="lidarRange" style="font-size:11px;margin-left:4px">
+                <option value="100">1 m</option>
+                <option value="200" selected>2 m</option>
+                <option value="400">4 m</option>
+                <option value="800">8 m</option>
+              </select>
+            </label>
+          </div>
+          <div style="display:flex;justify-content:center">
+            <canvas id="lidarCanvas" width="260" height="260" style="width:100%;max-width:260px;aspect-ratio:1/1"></canvas>
+          </div>
+          <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:8px;text-align:center;font-family:var(--font-mono)">
+            <div class="sensor-item-block"><div class="sensor-item-label">Front</div><b id="lidarF">--</b> <small>cm</small></div>
+            <div class="sensor-item-block"><div class="sensor-item-label">Left</div><b id="lidarL">--</b> <small>cm</small></div>
+            <div class="sensor-item-block"><div class="sensor-item-label">Right</div><b id="lidarR">--</b> <small>cm</small></div>
+            <div class="sensor-item-block"><div class="sensor-item-label">Rear</div><b id="lidarB">--</b> <small>cm</small></div>
+          </div>
+          <div id="lidarMeta" style="font-size:10px;color:var(--text-secondary);margin-top:6px;text-align:center"></div>
+        </div>
+      </div>
+
       <!-- ACCORDION: VISION AI & DE-WEATHERING -->
       <div class="ops-accordion" id="accVision">
         <div class="ops-accordion-hdr" onclick="toggleOpsAccordion('accVision')">
@@ -3516,8 +3547,78 @@ async function fetchFleet() {
 // =============================================================================
 // APPLY SELECTED VEHICLE TO UI (Section 9)
 // =============================================================================
+
+// ---------------------------------------------------------------- LiDAR 360 --
+let lastLidarData = null;
+function lidarColor(cm) {
+  const css = getComputedStyle(document.documentElement);
+  if (cm < 50) return css.getPropertyValue('--status-critical').trim() || '#C74646';
+  if (cm < 100) return css.getPropertyValue('--status-caution').trim() || '#C58A18';
+  return css.getPropertyValue('--status-safe').trim() || '#2E7D5B';
+}
+function drawLidar(l) {
+  const cv = document.getElementById('lidarCanvas');
+  if (!cv) return;
+  const ctx = cv.getContext('2d'), W = cv.width, H = cv.height, cx = W / 2, cy = H / 2, R = W / 2 - 14;
+  const maxCm = parseInt((document.getElementById('lidarRange') || {}).value || '200', 10);
+  const css = getComputedStyle(document.documentElement);
+  const grid = css.getPropertyValue('--border-subtle').trim() || '#E6EAE4';
+  const txt = css.getPropertyValue('--text-secondary').trim() || '#58615B';
+  ctx.clearRect(0, 0, W, H);
+  ctx.lineWidth = 1; ctx.strokeStyle = grid; ctx.fillStyle = txt; ctx.font = '9px monospace';
+  for (let i = 1; i <= 4; i++) {                       // range rings
+    const r = R * i / 4;
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.stroke();
+    ctx.fillText(`${Math.round(maxCm * i / 4)}`, cx + 3, cy - r + 10);
+  }
+  ctx.beginPath(); ctx.moveTo(cx, cy - R); ctx.lineTo(cx, cy + R); ctx.moveTo(cx - R, cy); ctx.lineTo(cx + R, cy); ctx.stroke();
+  // front sector (±20°) used for STOP / SLOW decisions
+  ctx.fillStyle = 'rgba(46,125,91,0.08)';
+  ctx.beginPath(); ctx.moveTo(cx, cy);
+  ctx.arc(cx, cy, R, -Math.PI / 2 - 20 * Math.PI / 180, -Math.PI / 2 + 20 * Math.PI / 180); ctx.closePath(); ctx.fill();
+  // truck
+  ctx.fillStyle = '#FFFFFF'; ctx.strokeStyle = txt;
+  ctx.fillRect(cx - 6, cy - 9, 12, 18); ctx.strokeRect(cx - 6, cy - 9, 12, 18);
+  ctx.beginPath(); ctx.moveTo(cx, cy - 14); ctx.lineTo(cx - 4, cy - 9); ctx.lineTo(cx + 4, cy - 9); ctx.closePath(); ctx.fillStyle = txt; ctx.fill();
+  ctx.fillStyle = txt; ctx.fillText('FRONT', cx - 14, 10);
+  if (!l || !Array.isArray(l.scan)) return;
+  const n = l.scan.length, step = 360 / n;
+  for (let i = 0; i < n; i++) {                        // one dot per 5° slice
+    const cm = l.scan[i];
+    if (!cm) continue;
+    const a = (i * step + step / 2 - 90) * Math.PI / 180;   // 0° = up (front), clockwise
+    const r = Math.min(cm, maxCm) / maxCm * R;
+    ctx.fillStyle = lidarColor(cm);
+    ctx.beginPath(); ctx.arc(cx + r * Math.cos(a), cy + r * Math.sin(a), cm > maxCm ? 2 : 3.5, 0, Math.PI * 2); ctx.fill();
+  }
+}
+function renderLidar(v) {
+  const s = (v && v.sensors) || {}, l = s.lidar;
+  const st = document.getElementById('lidarStatus'), meta = document.getElementById('lidarMeta');
+  if (!st) return;
+  const set = (id, val) => { const e = document.getElementById(id); if (e) e.textContent = (val === null || val === undefined) ? '--' : val; };
+  if (!l) {
+    st.textContent = v && v.source_type === 'REAL_HARDWARE' ? 'No LiDAR on this node' : 'LiDAR shown for hardware trucks only';
+    st.style.color = 'var(--text-secondary)';
+    ['lidarF', 'lidarL', 'lidarR', 'lidarB'].forEach(id => set(id, null));
+    if (meta) meta.textContent = '';
+    lastLidarData = null; drawLidar(null); return;
+  }
+  const live = l.ok && (l.age_s === undefined || l.age_s < 4);
+  st.textContent = live ? `🟢 ${l.sensor || 'LiDAR'} live` : '🔴 LiDAR not sending data';
+  st.style.color = live ? 'var(--status-safe)' : 'var(--status-critical)';
+  set('lidarF', l.front_cm); set('lidarL', l.left_cm); set('lidarR', l.right_cm); set('lidarB', l.rear_cm);
+  if (meta) meta.textContent = live
+    ? `${l.points || 0} points/scan · updated ${l.age_s !== undefined ? l.age_s + ' s ago' : 'now'} · red <50 cm · amber <100 cm`
+    : 'Check the USB cable and that pi_node.py runs with --lidar rplidar';
+  lastLidarData = live ? l : null;
+  drawLidar(lastLidarData);
+}
+document.addEventListener('change', e => { if (e.target && e.target.id === 'lidarRange') drawLidar(lastLidarData); });
+
 function applyVehicleToUI(v) {
   if (!v) return;
+  try { renderLidar(v); } catch (e) { console.error('renderLidar', e); }
 
   const isTruck1 = (v.id === 'TRUCK_01');
   const speedVal = isTruck1 ? 0.0 : (v.speed_kmh || 0.0);

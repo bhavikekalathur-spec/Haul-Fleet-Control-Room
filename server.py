@@ -2435,7 +2435,11 @@ def get_vehicle(vehicle_id):
         v["sequence"] = telemetry_sequence
         v["obstacles"] = list(world_obstacles.values())
 
-        return jsonify(v)
+        out = dict(v)
+        out["sensors"] = {k: ({**val, "age_s": round(time.time() - val["ts"], 1)}
+                              if isinstance(val, dict) and "ts" in val else val)
+                          for k, val in (v.get("sensors") or {}).items()}
+        return jsonify(out)
 
 
 @app.route("/api/dynamic_speed/<vehicle_id>", methods=["GET"])

@@ -96,6 +96,20 @@ class RPLidar(_Worker):
                 best = cm if best is None else min(best, cm)
         return None if best is None else int(best)
 
+    def _bins(self, scan, step=5):
+        """Nearest distance (cm) in each `step`-degree slice, 0 = front, clockwise.
+        0 means no return in that slice. 72 small ints keep the packet tiny."""
+        n = 360 // step
+        out = [0] * n
+        for _q, ang, mm in scan:
+            if mm <= 0 or mm / 10.0 < self.min_cm:
+                continue
+            i = int(((ang - self.off) % 360) // step) % n
+            cm = int(mm / 10.0)
+            if out[i] == 0 or cm < out[i]:
+                out[i] = cm
+        return out
+
     def run(self):
         from rplidar import RPLidar as _R
         while True:
@@ -108,6 +122,8 @@ class RPLidar(_Worker):
                                "front_cm": self._sector_min(scan, 0),
                                "right_cm": self._sector_min(scan, 90),
                                "left_cm": self._sector_min(scan, 270),
+                               "rear_cm": self._sector_min(scan, 180),
+                               "scan": self._bins(scan),
                                "points": len(scan), "ts": time.time()})
             except Exception as e:
                 self._set({"sensor": "RPLIDAR", "ok": False})
